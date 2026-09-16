@@ -126,6 +126,8 @@ Once running, explore the interactive documentation:
 - **Swagger UI**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 - **ReDoc**: [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc)
 
+> 📖 **Looking for a detailed walkthrough?** Check out the [Step-by-Step Execution Guide (RUN_GUIDE.md)](RUN_GUIDE.md) for full visual instructions on registering, authorizing, uploading PDFs, and generating summaries/quizzes in Swagger UI.
+
 ---
 
 ## 📋 Core Route List

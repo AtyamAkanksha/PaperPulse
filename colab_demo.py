@@ -31,6 +31,10 @@ import io
 import json
 import time
 
+# Configure UTF-8 encoding for Windows terminals
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # Ensure project root is in Python path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 

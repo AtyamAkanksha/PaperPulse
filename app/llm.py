@@ -7,60 +7,77 @@ from dotenv import load_dotenv
 from app.schemas import QuizSchema, QuizQuestion
 
 # Load environment variables
-load_dotenv()
+env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(env_file):
+    load_dotenv(dotenv_path=env_file, override=True)
+else:
+    load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+def _get_llm_client_configs() -> list[Dict[str, str]]:
+    """Determine prioritized list of LLM providers based on available API keys."""
+    configs = []
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip().strip('"').strip("'")
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip().strip('"').strip("'")
+    groq_key = os.getenv("GROQ_API_KEY", "").strip().strip('"').strip("'")
+    groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip().strip('"').strip("'")
 
-
-def _get_llm_client_config() -> Optional[Dict[str, str]]:
-    """Determine which LLM provider to use based on available API keys."""
-    if GROQ_API_KEY and GROQ_API_KEY.strip() and not GROQ_API_KEY.startswith("your-"):
-        return {
-            "url": "https://api.groq.com/openai/v1/chat/completions",
-            "api_key": GROQ_API_KEY.strip(),
-            "model": GROQ_MODEL,
-            "provider": "Groq",
-        }
-    elif OPENAI_API_KEY and OPENAI_API_KEY.strip() and not OPENAI_API_KEY.startswith("your-"):
-        return {
+    if openai_key and not openai_key.startswith("your-"):
+        configs.append({
             "url": "https://api.openai.com/v1/chat/completions",
-            "api_key": OPENAI_API_KEY.strip(),
-            "model": OPENAI_MODEL,
+            "api_key": openai_key,
+            "model": openai_model,
             "provider": "OpenAI",
-        }
-    return None
+        })
+    if groq_key and not groq_key.startswith("your-"):
+        configs.append({
+            "url": "https://api.groq.com/openai/v1/chat/completions",
+            "api_key": groq_key,
+            "model": groq_model,
+            "provider": "Groq",
+        })
+    return configs
 
 
 async def call_llm(messages: list, response_format_json: bool = False) -> str:
-    """Dispatches a chat completion call to configured LLM (Groq or OpenAI)."""
-    config = _get_llm_client_config()
-    if not config:
+    """Dispatches a chat completion call to available LLMs with automatic failover."""
+    configs = _get_llm_client_configs()
+    if not configs:
         logger.warning("No valid GROQ_API_KEY or OPENAI_API_KEY found. Using development mock.")
         return ""
 
-    headers = {
-        "Authorization": f"Bearer {config['api_key']}",
-        "Content-Type": "application/json",
-    }
-    payload: Dict[str, Any] = {
-        "model": config["model"],
-        "messages": messages,
-        "temperature": 0.3,
-    }
-    if response_format_json and config["provider"] in ["OpenAI", "Groq"]:
-        payload["response_format"] = {"type": "json_object"}
+    last_error = None
+    for config in configs:
+        headers = {
+            "Authorization": f"Bearer {config['api_key']}",
+            "Content-Type": "application/json",
+        }
+        payload: Dict[str, Any] = {
+            "model": config["model"],
+            "messages": messages,
+            "temperature": 0.3,
+        }
+        if response_format_json and config["provider"] in ["OpenAI", "Groq"]:
+            payload["response_format"] = {"type": "json_object"}
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        response = await client.post(config["url"], headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                response = await client.post(config["url"], headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+        except Exception as exc:
+            logger.warning(
+                "Call to %s (%s) failed: %s. Attempting fallback if available...",
+                config["provider"], config["model"], str(exc)
+            )
+            last_error = exc
+
+    if last_error:
+        logger.error("All configured LLM providers failed: %s", str(last_error))
+    return ""
 
 
 def clean_json_markdown(text: str) -> str:
@@ -93,19 +110,17 @@ async def generate_summary(text: str, filename: Optional[str] = None) -> str:
     )
     user_prompt = f"Document: {filename or 'Uploaded File'}\n\nContent:\n{truncated_text}"
 
-    config = _get_llm_client_config()
-    if config:
-        try:
-            summary = await call_llm(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ]
-            )
-            if summary and summary.strip():
-                return summary.strip()
-        except Exception as e:
-            logger.error("Error communicating with LLM provider: %s", str(e))
+    try:
+        summary = await call_llm(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
+        if summary and summary.strip():
+            return summary.strip()
+    except Exception as e:
+        logger.error("Error communicating with LLM provider: %s", str(e))
 
     # Dev fallback when API keys are absent or during network failures
     preview = " ".join(truncated_text.split()[:80])
@@ -155,29 +170,27 @@ async def generate_quiz(text: str, filename: Optional[str] = None, num_questions
     )
     user_prompt = f"Document: {filename or 'Uploaded File'}\nGenerate {num_questions} questions.\n\nContent:\n{truncated_text}"
 
-    config = _get_llm_client_config()
-    if config:
-        try:
-            raw_response = await call_llm(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format_json=True,
-            )
-            cleaned_json = clean_json_markdown(raw_response)
-            
-            # If the LLM returned a bare array instead of an object, wrap it
-            parsed_raw = json.loads(cleaned_json)
-            if isinstance(parsed_raw, list):
-                parsed_raw = {"title": f"Quiz for {filename or 'Document'}", "questions": parsed_raw}
-                cleaned_json = json.dumps(parsed_raw)
+    try:
+        raw_response = await call_llm(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format_json=True,
+        )
+        cleaned_json = clean_json_markdown(raw_response)
+        
+        # If the LLM returned a bare array instead of an object, wrap it
+        parsed_raw = json.loads(cleaned_json)
+        if isinstance(parsed_raw, list):
+            parsed_raw = {"title": f"Quiz for {filename or 'Document'}", "questions": parsed_raw}
+            cleaned_json = json.dumps(parsed_raw)
 
-            # Validate strictly through Pydantic
-            validated_quiz = QuizSchema.model_validate_json(cleaned_json)
-            return validated_quiz
-        except Exception as e:
-            logger.error("Failed to parse or validate LLM quiz response: %s", str(e))
+        # Validate strictly through Pydantic
+        validated_quiz = QuizSchema.model_validate_json(cleaned_json)
+        return validated_quiz
+    except Exception as e:
+        logger.error("Failed to parse or validate LLM quiz response: %s", str(e))
 
     # Dev fallback when API keys are absent
     return QuizSchema(
